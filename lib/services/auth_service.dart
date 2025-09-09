@@ -1,6 +1,9 @@
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:googleapis_auth/googleapis_auth.dart' as auth show AuthClient, AccessCredentials, AccessToken;
+import 'package:googleapis_auth/googleapis_auth.dart'
+    as auth
+    show AuthClient, AccessCredentials, AccessToken;
 import 'package:http/http.dart' as http;
+import 'simple_logger.dart';
 
 class AuthService {
   static const _scopes = [
@@ -17,11 +20,8 @@ class AuthService {
   bool get isAuthenticated => _currentUser != null;
 
   Future<void> checkExistingAuth(String clientId) async {
-    _googleSignIn = GoogleSignIn(
-      clientId: clientId,
-      scopes: _scopes,
-    );
-    
+    _googleSignIn = GoogleSignIn(clientId: clientId, scopes: _scopes);
+
     try {
       _currentUser = await _googleSignIn!.signInSilently();
       if (_currentUser != null) {
@@ -29,15 +29,12 @@ class AuthService {
         _authClient = _AuthenticatedClient(authHeaders);
       }
     } catch (e) {
-      print('Silent sign-in failed: $e');
+      SimpleLogger.log('Silent sign-in failed: $e');
     }
   }
 
   Future<bool> signIn(String clientId) async {
-    _googleSignIn = GoogleSignIn(
-      clientId: clientId,
-      scopes: _scopes,
-    );
+    _googleSignIn = GoogleSignIn(clientId: clientId, scopes: _scopes);
     try {
       _currentUser = await _googleSignIn!.signIn();
 
@@ -48,7 +45,7 @@ class AuthService {
       }
       return false;
     } catch (e) {
-      print('Auth error: $e');
+      SimpleLogger.log('Auth error: $e');
       return false;
     }
   }
@@ -66,11 +63,16 @@ class _AuthenticatedClient extends http.BaseClient implements auth.AuthClient {
   final http.Client _client = http.Client();
   final auth.AccessCredentials _credentials;
 
-  _AuthenticatedClient(this._headers) : _credentials = auth.AccessCredentials(
-    auth.AccessToken('Bearer', _headers['Authorization']?.replaceFirst('Bearer ', '') ?? '', DateTime.now().toUtc().add(Duration(hours: 1))),
-    null,
-    [],
-  );
+  _AuthenticatedClient(this._headers)
+    : _credentials = auth.AccessCredentials(
+        auth.AccessToken(
+          'Bearer',
+          _headers['Authorization']?.replaceFirst('Bearer ', '') ?? '',
+          DateTime.now().toUtc().add(Duration(hours: 1)),
+        ),
+        null,
+        [],
+      );
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) {

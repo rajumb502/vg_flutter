@@ -3,8 +3,10 @@ import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'services/auth_service.dart';
 import 'services/email_service.dart';
+import 'services/drive_service.dart';
 import 'services/vector_store_factory.dart';
 import 'services/vector_store.dart';
+import 'screens/settings_screen.dart';
 
 void main() {
   runApp(const VoiceGuideApp());
@@ -46,10 +48,10 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<String> _messages = [];
   GenerativeModel? _model;
   bool _isLoading = false;
-  String? _apiKey;
 
   final AuthService _authService = AuthService();
   EmailService? _emailService;
+  DriveService? _driveService;
   late final VectorStore _vectorStore;
 
   @override
@@ -61,12 +63,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _loadApiKey() {
     SharedPreferences.getInstance().then((prefs) {
-      final apiKey = prefs.getString('gemini_api_key');
+      final apiKey = prefs.getString('google_api_key');
       if (apiKey != null && apiKey.isNotEmpty) {
+        final chatModel = prefs.getString('chat_model') ?? geminiChatModel;
         setState(() {
-          _apiKey = apiKey;
-          _model = GenerativeModel(model: geminiChatModel, apiKey: apiKey);
+          _model = GenerativeModel(model: chatModel, apiKey: apiKey);
           _emailService = EmailService(apiKey);
+          _driveService = DriveService(apiKey);
         });
         // Check for existing Google authentication
         _authService.checkExistingAuth(googleClientId).then((_) {
@@ -79,7 +82,10 @@ class _ChatScreenState extends State<ChatScreen> {
   void _sendMessage() async {
     if (_controller.text.trim().isEmpty) return;
     if (_model == null) {
-      _showSettingsDialog();
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => const SettingsScreen()),
+      ).then((_) => _loadApiKey());
       return;
     }
 
@@ -114,49 +120,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _showSettingsDialog() {
-    final apiKeyController = TextEditingController(text: _apiKey ?? '');
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Settings'),
-        content: TextField(
-          controller: apiKeyController,
-          decoration: const InputDecoration(
-            labelText: 'Gemini API Key',
-            hintText: 'Enter your API key',
-          ),
-          obscureText: true,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () async {
-              final apiKey = apiKeyController.text.trim();
-              if (apiKey.isNotEmpty) {
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.setString('gemini_api_key', apiKey);
-                setState(() {
-                  _apiKey = apiKey;
-                  _model = GenerativeModel(
-                    model: geminiChatModel,
-                    apiKey: apiKey,
-                  );
-                  _emailService = EmailService(apiKey);
-                });
-              }
-              Navigator.pop(context);
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -176,6 +139,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           if (_authService.isAuthenticated) ...[
             IconButton(onPressed: _indexEmails, icon: const Icon(Icons.email)),
+            IconButton(onPressed: _indexDrive, icon: const Icon(Icons.folder)),
             IconButton(onPressed: _viewStore, icon: const Icon(Icons.storage)),
             IconButton(
               onPressed: () {
@@ -186,7 +150,10 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ],
           IconButton(
-            onPressed: _showSettingsDialog,
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const SettingsScreen()),
+            ).then((_) => _loadApiKey()),
             icon: const Icon(Icons.settings),
           ),
         ],
@@ -244,21 +211,94 @@ class _ChatScreenState extends State<ChatScreen> {
   void _viewStore() async {
     final contents = await _vectorStore.getAllContents();
     final count = await _vectorStore.count;
-    
+
     setState(() {
       _messages.add('📦 Vector Store Contents: $count items');
       if (contents.isEmpty) {
         _messages.add('Store is empty. Index some emails first!');
       } else {
         for (final content in contents.take(5)) {
-          final hasEmbedding = content.embedding != null && content.embedding!.isNotEmpty;
-          _messages.add('📄 ${content.title} (${content.contentType.name}) - Embedding: ${hasEmbedding ? "✅" : "❌"}');
+          final hasEmbedding =
+              content.embedding != null && content.embedding!.isNotEmpty;
+          _messages.add(
+            '📄 ${content.title} (${content.contentType.name}) - Embedding: ${hasEmbedding ? "✅" : "❌"}',
+          );
         }
         if (contents.length > 5) {
           _messages.add('... and ${contents.length - 5} more items');
         }
       }
     });
+  }
+
+  void _indexDrive() async {
+    if (_driveService == null || _authService.authClient == null) {
+      setState(() {
+        _messages.add(
+          'VoiceGuide: Please sign in first and ensure API key is set.',
+        );
+      });
+      return;
+    }
+
+    setState(() {
+      _messages.add('VoiceGuide: Indexing Drive files...');
+      _isLoading = true;
+    });
+
+    try {
+      setState(() {
+        _messages.add('VoiceGuide: Fetching file list from Drive...');
+      });
+
+      final documents = await _driveService!.fetchDriveFiles(
+        _authService.authClient!,
+      );
+
+      setState(() {
+        _messages.add('VoiceGuide: Found ${documents.length} files to process');
+      });
+
+      if (documents.isEmpty) {
+        setState(() {
+          _messages.add('VoiceGuide: No new files found since last sync');
+          _isLoading = false;
+        });
+        return;
+      }
+
+      await _vectorStore.addContents(documents);
+      final totalCount = await _vectorStore.count;
+
+      final withEmbeddings = documents
+          .where((d) => d.embedding != null && d.embedding!.isNotEmpty)
+          .length;
+      final withoutEmbeddings = documents.length - withEmbeddings;
+
+      setState(() {
+        _messages.add('VoiceGuide: Indexed ${documents.length} Drive files');
+        if (withEmbeddings > 0) {
+          _messages.add('✅ $withEmbeddings with embeddings');
+        }
+        if (withoutEmbeddings > 0) {
+          _messages.add(
+            '⚠️ $withoutEmbeddings without embeddings (API quota/errors)',
+          );
+        }
+        _messages.add('Total stored: $totalCount items');
+        for (final doc in documents.take(3)) {
+          final hasEmbedding =
+              doc.embedding != null && doc.embedding!.isNotEmpty;
+          _messages.add('📄 ${doc.title} ${hasEmbedding ? "✅" : "⚠️"}');
+        }
+        _isLoading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _messages.add('VoiceGuide: Error indexing Drive files: $e');
+        _isLoading = false;
+      });
+    }
   }
 
   void _indexEmails() async {
@@ -278,27 +318,34 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       final emails = await _emailService!.fetchEmails(_authService.authClient!);
-      
+
       // Always store emails, even if embeddings failed
       await _vectorStore.addContents(emails);
       final totalCount = await _vectorStore.count;
-      
+
       // Count how many have embeddings
-      final withEmbeddings = emails.where((e) => e.embedding != null && e.embedding!.isNotEmpty).length;
+      final withEmbeddings = emails
+          .where((e) => e.embedding != null && e.embedding!.isNotEmpty)
+          .length;
       final withoutEmbeddings = emails.length - withEmbeddings;
-      
+
       setState(() {
         _messages.add('VoiceGuide: Indexed ${emails.length} emails');
         if (withEmbeddings > 0) {
           _messages.add('✅ $withEmbeddings with embeddings');
         }
         if (withoutEmbeddings > 0) {
-          _messages.add('⚠️ $withoutEmbeddings without embeddings (API quota/errors)');
+          _messages.add(
+            '⚠️ $withoutEmbeddings without embeddings (API quota/errors)',
+          );
         }
         _messages.add('Total stored: $totalCount items');
         for (final email in emails.take(3)) {
-          final hasEmbedding = email.embedding != null && email.embedding!.isNotEmpty;
-          _messages.add('📧 ${email.title} from ${email.author} ${hasEmbedding ? "✅" : "⚠️"}');
+          final hasEmbedding =
+              email.embedding != null && email.embedding!.isNotEmpty;
+          _messages.add(
+            '📧 ${email.title} from ${email.author} ${hasEmbedding ? "✅" : "⚠️"}',
+          );
         }
         _isLoading = false;
       });
