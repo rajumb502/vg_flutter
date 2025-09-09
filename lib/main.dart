@@ -3,7 +3,8 @@ import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'services/auth_service.dart';
 import 'services/email_service.dart';
-
+import 'services/vector_store_factory.dart';
+import 'services/vector_store.dart';
 
 void main() {
   runApp(const VoiceGuideApp());
@@ -49,11 +50,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
   final AuthService _authService = AuthService();
   EmailService? _emailService;
-
+  late final VectorStore _vectorStore;
 
   @override
   void initState() {
     super.initState();
+    _vectorStore = VectorStoreFactory.getInstance();
     _loadApiKey();
   }
 
@@ -172,11 +174,9 @@ class _ChatScreenState extends State<ChatScreen> {
               },
               icon: const Icon(Icons.login),
             ),
-          if (_authService.isAuthenticated) ..[
-            IconButton(
-              onPressed: _indexEmails,
-              icon: const Icon(Icons.email),
-            ),
+          if (_authService.isAuthenticated) ...[
+            IconButton(onPressed: _indexEmails, icon: const Icon(Icons.email)),
+            IconButton(onPressed: _viewStore, icon: const Icon(Icons.storage)),
             IconButton(
               onPressed: () {
                 _authService.signOut();
@@ -241,10 +241,32 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  void _viewStore() async {
+    final contents = await _vectorStore.getAllContents();
+    final count = await _vectorStore.count;
+    
+    setState(() {
+      _messages.add('📦 Vector Store Contents: $count items');
+      if (contents.isEmpty) {
+        _messages.add('Store is empty. Index some emails first!');
+      } else {
+        for (final content in contents.take(5)) {
+          final hasEmbedding = content.embedding != null && content.embedding!.isNotEmpty;
+          _messages.add('📄 ${content.title} (${content.contentType.name}) - Embedding: ${hasEmbedding ? "✅" : "❌"}');
+        }
+        if (contents.length > 5) {
+          _messages.add('... and ${contents.length - 5} more items');
+        }
+      }
+    });
+  }
+
   void _indexEmails() async {
     if (_emailService == null || _authService.authClient == null) {
       setState(() {
-        _messages.add('VoiceGuide: Please sign in first and ensure API key is set.');
+        _messages.add(
+          'VoiceGuide: Please sign in first and ensure API key is set.',
+        );
       });
       return;
     }
@@ -256,10 +278,27 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       final emails = await _emailService!.fetchEmails(_authService.authClient!);
+      
+      // Always store emails, even if embeddings failed
+      await _vectorStore.addContents(emails);
+      final totalCount = await _vectorStore.count;
+      
+      // Count how many have embeddings
+      final withEmbeddings = emails.where((e) => e.embedding != null && e.embedding!.isNotEmpty).length;
+      final withoutEmbeddings = emails.length - withEmbeddings;
+      
       setState(() {
-        _messages.add('VoiceGuide: Successfully indexed ${emails.length} emails with embeddings!');
+        _messages.add('VoiceGuide: Indexed ${emails.length} emails');
+        if (withEmbeddings > 0) {
+          _messages.add('✅ $withEmbeddings with embeddings');
+        }
+        if (withoutEmbeddings > 0) {
+          _messages.add('⚠️ $withoutEmbeddings without embeddings (API quota/errors)');
+        }
+        _messages.add('Total stored: $totalCount items');
         for (final email in emails.take(3)) {
-          _messages.add('📧 ${email.title} from ${email.author}');
+          final hasEmbedding = email.embedding != null && email.embedding!.isNotEmpty;
+          _messages.add('📧 ${email.title} from ${email.author} ${hasEmbedding ? "✅" : "⚠️"}');
         }
         _isLoading = false;
       });
