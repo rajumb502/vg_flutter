@@ -53,8 +53,7 @@ class PersistentWebVectorStore extends VectorStore {
 
     final contents = <ContentEntity>[];
     await for (final cursorWithValue in cursor) {
-      final rawValue = cursorWithValue.value;
-      final map = Map<String, dynamic>.from(rawValue as Map);
+      final map = cursorWithValue.value as Map<String, dynamic>;
       contents.add(_mapToContent(map));
       cursorWithValue.next();
     }

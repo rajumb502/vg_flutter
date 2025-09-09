@@ -7,6 +7,7 @@ import 'services/drive_service.dart';
 import 'services/vector_store_factory.dart';
 import 'services/vector_store.dart';
 import 'screens/settings_screen.dart';
+import 'models/content_entity.dart';
 
 void main() {
   runApp(const VoiceGuideApp());
@@ -48,6 +49,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<String> _messages = [];
   GenerativeModel? _model;
   bool _isLoading = false;
+  String? _apiKey;
 
   final AuthService _authService = AuthService();
   EmailService? _emailService;
@@ -59,6 +61,13 @@ class _ChatScreenState extends State<ChatScreen> {
     super.initState();
     _vectorStore = VectorStoreFactory.getInstance();
     _loadApiKey();
+    _checkExistingAuth();
+  }
+
+  void _checkExistingAuth() async {
+    await _authService.checkExistingAuth(googleClientId);
+    print('Auth check complete. Authenticated: ${_authService.isAuthenticated}');
+    setState(() {}); // Refresh UI with auth state
   }
 
   void _loadApiKey() {
@@ -67,13 +76,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (apiKey != null && apiKey.isNotEmpty) {
         final chatModel = prefs.getString('chat_model') ?? geminiChatModel;
         setState(() {
+          _apiKey = apiKey;
           _model = GenerativeModel(model: chatModel, apiKey: apiKey);
           _emailService = EmailService(apiKey);
           _driveService = DriveService(apiKey);
-        });
-        // Check for existing Google authentication
-        _authService.checkExistingAuth(googleClientId).then((_) {
-          setState(() {}); // Refresh UI if auth state changed
         });
       }
     });
@@ -98,9 +104,17 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     try {
+      // Search for relevant content
+      final relevantContent = await _searchRelevantContent(userMessage);
+
+      // Build context from relevant content
+      final contextText = relevantContent.isNotEmpty
+          ? 'Relevant information from your emails and documents:\n${relevantContent.cast<ContentEntity>().map((c) => '- ${c.title}: ${c.content.substring(0, 200)}...').join('\n')}\n\n'
+          : '';
+
       final response = await _model!.generateContent([
         Content.text(
-          'You are VoiceGuide, an AI assistant for people with visual disabilities. Help with their goals in a simple, clear way. User says: $userMessage',
+          '${contextText}You are VoiceGuide, an AI assistant for people with visual disabilities. Help with their goals in a simple, clear way. User says: $userMessage',
         ),
       ]);
 
@@ -354,6 +368,31 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages.add('VoiceGuide: Error indexing emails: $e');
         _isLoading = false;
       });
+    }
+  }
+
+  Future<List<ContentEntity>> _searchRelevantContent(String query) async {
+    if (_emailService == null) return [];
+
+    try {
+      // Generate embedding for the user query
+      final prefs = await SharedPreferences.getInstance();
+      final embeddingModel =
+          prefs.getString('embedding_model') ?? 'gemini-embedding-001';
+      final model = GenerativeModel(model: embeddingModel, apiKey: _apiKey!);
+
+      final queryEmbedding = await model.embedContent(Content.text(query));
+
+      // Search vector store for similar content
+      final results = await _vectorStore.searchSimilar(
+        queryEmbedding.embedding.values,
+        limit: 3,
+      );
+
+      return results;
+    } catch (e) {
+      print('Error searching content: $e');
+      return [];
     }
   }
 

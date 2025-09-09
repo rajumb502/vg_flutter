@@ -3,6 +3,7 @@ import 'package:googleapis_auth/googleapis_auth.dart'
     as auth
     show AuthClient, AccessCredentials, AccessToken;
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'simple_logger.dart';
 
 class AuthService {
@@ -15,32 +16,55 @@ class AuthService {
   GoogleSignIn? _googleSignIn;
   auth.AuthClient? _authClient;
   GoogleSignInAccount? _currentUser;
+  String? _clientId;
 
   auth.AuthClient? get authClient => _authClient;
   bool get isAuthenticated => _currentUser != null;
 
   Future<void> checkExistingAuth(String clientId) async {
-    _googleSignIn = GoogleSignIn(clientId: clientId, scopes: _scopes);
+    _clientId = clientId;
+    _googleSignIn ??= GoogleSignIn(clientId: clientId, scopes: _scopes);
+
+    // Check stored auth state first
+    final prefs = await SharedPreferences.getInstance();
+    final isSignedIn = prefs.getBool('google_signed_in') ?? false;
+    
+    if (!isSignedIn) {
+      SimpleLogger.log('No stored auth state found');
+      return;
+    }
 
     try {
       _currentUser = await _googleSignIn!.signInSilently();
       if (_currentUser != null) {
+        SimpleLogger.log('Restored user: ${_currentUser!.email}');
         final authHeaders = await _currentUser!.authHeaders;
         _authClient = _AuthenticatedClient(authHeaders);
+      } else {
+        // Clear stored state if silent sign-in fails
+        await prefs.setBool('google_signed_in', false);
+        SimpleLogger.log('Failed to restore user, cleared stored state');
       }
     } catch (e) {
+      await prefs.setBool('google_signed_in', false);
       SimpleLogger.log('Silent sign-in failed: $e');
     }
   }
 
   Future<bool> signIn(String clientId) async {
-    _googleSignIn = GoogleSignIn(clientId: clientId, scopes: _scopes);
+    _clientId = clientId;
+    _googleSignIn ??= GoogleSignIn(clientId: clientId, scopes: _scopes);
     try {
       _currentUser = await _googleSignIn!.signIn();
 
       if (_currentUser != null) {
         final authHeaders = await _currentUser!.authHeaders;
         _authClient = _AuthenticatedClient(authHeaders);
+        
+        // Store auth state
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('google_signed_in', true);
+        
         return true;
       }
       return false;
@@ -50,11 +74,15 @@ class AuthService {
     }
   }
 
-  void signOut() {
+  void signOut() async {
     _googleSignIn?.signOut();
     _authClient?.close();
     _authClient = null;
     _currentUser = null;
+    
+    // Clear stored auth state
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('google_signed_in', false);
   }
 }
 
