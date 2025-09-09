@@ -1,13 +1,18 @@
 import 'package:flutter/material.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'services/auth_service.dart';
+import 'services/email_service.dart';
+
 
 void main() {
   runApp(const VoiceGuideApp());
 }
 
-final geminiChatModel = 'gemini-2.5-flash';
-final geminiEmbeddingModel = 'gemini-embedding-001';
+const geminiChatModel = 'gemini-2.5-flash';
+const geminiEmbeddingModel = 'gemini-embedding-001';
+const googleClientId =
+    '734081178634-59heofe6sep82c3qvnf1kbkaic94bu4q.apps.googleusercontent.com'; // Replace with your actual client ID
 
 class VoiceGuideApp extends StatelessWidget {
   const VoiceGuideApp({super.key});
@@ -42,21 +47,28 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isLoading = false;
   String? _apiKey;
 
+  final AuthService _authService = AuthService();
+  EmailService? _emailService;
+
+
   @override
   void initState() {
     super.initState();
-    print('initState called');
     _loadApiKey();
   }
 
   void _loadApiKey() {
     SharedPreferences.getInstance().then((prefs) {
       final apiKey = prefs.getString('gemini_api_key');
-      print('Loaded API key: ${apiKey != null ? 'Found' : 'Not found'}');
       if (apiKey != null && apiKey.isNotEmpty) {
         setState(() {
           _apiKey = apiKey;
           _model = GenerativeModel(model: geminiChatModel, apiKey: apiKey);
+          _emailService = EmailService(apiKey);
+        });
+        // Check for existing Google authentication
+        _authService.checkExistingAuth(googleClientId).then((_) {
+          setState(() {}); // Refresh UI if auth state changed
         });
       }
     });
@@ -131,6 +143,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     model: geminiChatModel,
                     apiKey: apiKey,
                   );
+                  _emailService = EmailService(apiKey);
                 });
               }
               Navigator.pop(context);
@@ -148,6 +161,30 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: AppBar(
         title: const Text('VoiceGuide Chat'),
         actions: [
+          if (!_authService.isAuthenticated)
+            IconButton(
+              onPressed: () async {
+                final success = await _authService.signIn(googleClientId);
+                if (success) {
+                  setState(() {});
+                  _messages.add('VoiceGuide: Connected to Google services!');
+                }
+              },
+              icon: const Icon(Icons.login),
+            ),
+          if (_authService.isAuthenticated) ..[
+            IconButton(
+              onPressed: _indexEmails,
+              icon: const Icon(Icons.email),
+            ),
+            IconButton(
+              onPressed: () {
+                _authService.signOut();
+                setState(() {});
+              },
+              icon: const Icon(Icons.logout),
+            ),
+          ],
           IconButton(
             onPressed: _showSettingsDialog,
             icon: const Icon(Icons.settings),
@@ -188,13 +225,13 @@ class _ChatScreenState extends State<ChatScreen> {
                 const SizedBox(width: 8),
                 ElevatedButton(
                   onPressed: _isLoading ? null : _sendMessage,
-                  child: _isLoading 
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Text('Send'),
+                  child: _isLoading
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Send'),
                 ),
               ],
             ),
@@ -202,6 +239,36 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
     );
+  }
+
+  void _indexEmails() async {
+    if (_emailService == null || _authService.authClient == null) {
+      setState(() {
+        _messages.add('VoiceGuide: Please sign in first and ensure API key is set.');
+      });
+      return;
+    }
+
+    setState(() {
+      _messages.add('VoiceGuide: Indexing emails...');
+      _isLoading = true;
+    });
+
+    try {
+      final emails = await _emailService!.fetchEmails(_authService.authClient!);
+      setState(() {
+        _messages.add('VoiceGuide: Successfully indexed ${emails.length} emails with embeddings!');
+        for (final email in emails.take(3)) {
+          _messages.add('📧 ${email.title} from ${email.author}');
+        }
+        _isLoading = false;
+      });
+    } catch (e) {
+      setState(() {
+        _messages.add('VoiceGuide: Error indexing emails: $e');
+        _isLoading = false;
+      });
+    }
   }
 
   @override
