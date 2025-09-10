@@ -139,7 +139,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       // Build context from relevant content
       final contextText = relevantContent.isNotEmpty
-          ? 'Relevant information from your emails and documents:\n${relevantContent.cast<ContentEntity>().map((c) => '- ${c.title}: ${_extractRelevantPortion(c.content, userMessage)}...').join('\n')}\n\n'
+          ? await _buildContextText(relevantContent.cast<ContentEntity>().toList(), userMessage)
           : '';
 
       // Build conversation context from recent messages
@@ -157,11 +157,57 @@ class _ChatScreenState extends State<ChatScreen> {
           ? 'Recent conversation:\n$conversationContext\n\n'
           : '';
 
+      final tools = [
+        Tool(
+          functionDeclarations: [
+            FunctionDeclaration(
+              'view_vector_store',
+              'View contents of the vector store including emails, documents, and chat history',
+              Schema(SchemaType.object),
+            ),
+            FunctionDeclaration(
+              'login_google',
+              'Sign in to Google services to access Gmail and Google Drive',
+              Schema(SchemaType.object),
+            ),
+            FunctionDeclaration(
+              'index_emails',
+              'ONLY use when user explicitly asks to fetch or index NEW emails from Gmail. Do not use for analyzing existing emails.',
+              Schema(SchemaType.object),
+            ),
+            FunctionDeclaration(
+              'index_drive',
+              'ONLY use when user explicitly asks to fetch or index NEW documents from Google Drive. Do not use for analyzing existing documents.',
+              Schema(
+                SchemaType.object,
+                properties: {
+                  'force_reindex': Schema(
+                    SchemaType.boolean,
+                    description:
+                        'Whether to re-index all files instead of just the new ones',
+                  ),
+                },
+              ),
+            ),
+            FunctionDeclaration(
+              'generate_embeddings',
+              'Generate embeddings for content that is missing them',
+              Schema(SchemaType.object),
+            ),
+          ],
+        ),
+      ];
+
       final response = await _model!.generateContent([
         Content.text(
-          '$contextText${contextPrefix}You are VoiceGuide, an AI assistant for people with visual disabilities. Help with their goals in a simple, clear way. Maintain conversation context and refer to previous exchanges when relevant. User says: $userMessage',
+          '$contextText${contextPrefix}You are VoiceGuide, an AI assistant for people with visual disabilities. Help with their goals in a simple, clear way. Use the provided relevant information from emails and documents to answer questions. Only use functions to fetch NEW data when explicitly requested. For analysis and summaries, use the existing data provided in the context. User says: $userMessage',
         ),
-      ]);
+      ], tools: tools);
+
+      if (response.functionCalls.isNotEmpty) {
+        await _handleFunctionCalls(response.functionCalls.toList());
+        return;
+      }
 
       final aiResponse = response.text ?? "I'm sorry, I couldn't process that.";
 
@@ -759,6 +805,31 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  Future<String> _buildContextText(List<ContentEntity> relevantContent, String userMessage) async {
+    final needsFullContent = await _needsFullContent(userMessage);
+    
+    if (needsFullContent) {
+      // For analysis/summary requests, provide full content
+      return 'Your emails and documents:\n${relevantContent.map((c) => '=== ${c.title} ===\n${c.content}\n').join('\n')}\n';
+    } else {
+      // For other requests, provide relevant portions
+      return 'Relevant information from your emails and documents:\n${relevantContent.map((c) => '- ${c.title}: ${_extractRelevantPortion(c.content, userMessage)}...').join('\n')}\n\n';
+    }
+  }
+
+  Future<bool> _needsFullContent(String userMessage) async {
+    if (_model == null) return false;
+    
+    try {
+      final intentPrompt = 'Does this user request need FULL content to answer properly? Answer only "yes" or "no":\n\n"$userMessage"\n\nExamples that need full content: summarize, analyze, explain in detail, what does this say, describe the content\nExamples that need partial content: find, search for, when did, who sent';
+      
+      final response = await _model!.generateContent([Content.text(intentPrompt)]);
+      return response.text?.toLowerCase().trim() == 'yes';
+    } catch (e) {
+      return false; // Default to partial content on error
+    }
+  }
+
   String _extractRelevantPortion(String content, String query) {
     const maxTokens = 500; // ~1500 characters at 3 chars per token
     const maxChars = maxTokens * 3;
@@ -872,6 +943,66 @@ class _ChatScreenState extends State<ChatScreen> {
         .take(3)
         .join(', ');
     return foundTopics.isNotEmpty ? foundTopics : 'general assistance';
+  }
+
+  Future<void> _handleFunctionCalls(List<FunctionCall> functionCalls) async {
+    for (final call in functionCalls) {
+      switch (call.name) {
+        case 'view_vector_store':
+          _viewStore();
+          break;
+        case 'login_google':
+          if (!_authService.isAuthenticated) {
+            final success = await _authService.signIn(googleClientId);
+            if (success) {
+              setState(() {
+                _messages.add(
+                  ChatMessage(
+                    content: 'Successfully connected to Google services!',
+                    isUser: false,
+                    type: MessageType.llmResponse,
+                  ),
+                );
+              });
+            } else {
+              setState(() {
+                _messages.add(
+                  ChatMessage(
+                    content: 'Failed to connect to Google services.',
+                    isUser: false,
+                    type: MessageType.llmResponse,
+                  ),
+                );
+              });
+            }
+          } else {
+            setState(() {
+              _messages.add(
+                ChatMessage(
+                  content: 'Already connected to Google services.',
+                  isUser: false,
+                  type: MessageType.llmResponse,
+                ),
+              );
+            });
+          }
+          break;
+        case 'index_emails':
+          _indexEmails();
+          break;
+        case 'index_drive':
+          final forceReindex = call.args['force_reindex'] as bool? ?? false;
+          _indexDriveInternal(forceReindex: forceReindex);
+          break;
+        case 'generate_embeddings':
+          _generateMissingEmbeddings();
+          break;
+      }
+    }
+
+    setState(() {
+      _isLoading = false;
+    });
   }
 
   @override
