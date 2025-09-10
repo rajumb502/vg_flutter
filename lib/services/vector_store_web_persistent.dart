@@ -1,3 +1,4 @@
+// ignore: deprecated_member_use
 import 'dart:html' as html;
 import 'dart:math' as math;
 import '../models/content_entity.dart';

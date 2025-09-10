@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vg_flutter/services/simple_logger.dart';
 import 'services/auth_service.dart';
 import 'services/email_service.dart';
 import 'services/drive_service.dart';
@@ -8,6 +9,7 @@ import 'services/vector_store_factory.dart';
 import 'services/vector_store.dart';
 import 'screens/settings_screen.dart';
 import 'models/content_entity.dart';
+import 'services/embedding_service.dart';
 
 void main() {
   runApp(const VoiceGuideApp());
@@ -66,7 +68,9 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _checkExistingAuth() async {
     await _authService.checkExistingAuth(googleClientId);
-    print('Auth check complete. Authenticated: ${_authService.isAuthenticated}');
+    SimpleLogger.log(
+      'Auth check complete. Authenticated: ${_authService.isAuthenticated}',
+    );
     setState(() {}); // Refresh UI with auth state
   }
 
@@ -140,6 +144,9 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: AppBar(
         title: const Text('VoiceGuide Chat'),
         actions: [
+          // Vector store button - always visible (local content)
+          IconButton(onPressed: _viewStore, icon: const Icon(Icons.storage)),
+          
           if (!_authService.isAuthenticated)
             IconButton(
               onPressed: () async {
@@ -153,8 +160,20 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           if (_authService.isAuthenticated) ...[
             IconButton(onPressed: _indexEmails, icon: const Icon(Icons.email)),
-            IconButton(onPressed: _indexDrive, icon: const Icon(Icons.folder)),
-            IconButton(onPressed: _viewStore, icon: const Icon(Icons.storage)),
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.folder),
+              onSelected: (value) {
+                if (value == 'index') _indexDrive();
+                if (value == 'force') _indexDriveForce();
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem(value: 'index', child: Text('Index Drive')),
+                const PopupMenuItem(
+                  value: 'force',
+                  child: Text('Force Re-index'),
+                ),
+              ],
+            ),
             IconButton(
               onPressed: () {
                 _authService.signOut();
@@ -163,6 +182,14 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.logout),
             ),
           ],
+          
+          // Generate embeddings button - visible when API key is set
+          if (_apiKey != null)
+            IconButton(
+              onPressed: _generateMissingEmbeddings,
+              icon: const Icon(Icons.auto_fix_high),
+            ),
+            
           IconButton(
             onPressed: () => Navigator.push(
               context,
@@ -225,27 +252,50 @@ class _ChatScreenState extends State<ChatScreen> {
   void _viewStore() async {
     final contents = await _vectorStore.getAllContents();
     final count = await _vectorStore.count;
+    final withEmbeddings = contents.where((c) => c.embedding != null && c.embedding!.isNotEmpty).length;
+    final withoutEmbeddings = contents.where((c) => c.embedding == null || c.embedding!.isEmpty).toList();
 
     setState(() {
       _messages.add('📦 Vector Store Contents: $count items');
+      _messages.add('✅ With embeddings: $withEmbeddings');
+      _messages.add('❌ Without embeddings: ${withoutEmbeddings.length}');
+      
       if (contents.isEmpty) {
         _messages.add('Store is empty. Index some emails first!');
       } else {
+        _messages.add('\n--- Sample Contents ---');
         for (final content in contents.take(5)) {
-          final hasEmbedding =
-              content.embedding != null && content.embedding!.isNotEmpty;
-          _messages.add(
-            '📄 ${content.title} (${content.contentType.name}) - Embedding: ${hasEmbedding ? "✅" : "❌"}',
-          );
+          final hasEmbedding = content.embedding != null && content.embedding!.isNotEmpty;
+          _messages.add('📄 ${content.title} (${content.contentType.name}) - ${hasEmbedding ? "✅" : "❌"}');
         }
         if (contents.length > 5) {
           _messages.add('... and ${contents.length - 5} more items');
+        }
+        
+        if (withoutEmbeddings.isNotEmpty) {
+          _messages.add('\n--- Missing Embeddings (with sizes) ---');
+          for (final content in withoutEmbeddings.take(10)) {
+            final sizeKB = (content.content.length / 1024).toStringAsFixed(1);
+            final tokens = (content.content.length / 4).round(); // Rough estimate: 4 chars per token
+            _messages.add('❌ ${content.title}: ${sizeKB}KB (~$tokens tokens)');
+          }
+          if (withoutEmbeddings.length > 10) {
+            _messages.add('... and ${withoutEmbeddings.length - 10} more without embeddings');
+          }
         }
       }
     });
   }
 
+  void _indexDriveForce() async {
+    _indexDriveInternal(forceReindex: true);
+  }
+
   void _indexDrive() async {
+    _indexDriveInternal(forceReindex: false);
+  }
+
+  void _indexDriveInternal({required bool forceReindex}) async {
     if (_driveService == null || _authService.authClient == null) {
       setState(() {
         _messages.add(
@@ -256,7 +306,11 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     setState(() {
-      _messages.add('VoiceGuide: Indexing Drive files...');
+      _messages.add(
+        forceReindex
+            ? 'VoiceGuide: Force re-indexing all Drive files...'
+            : 'VoiceGuide: Indexing Drive files...',
+      );
       _isLoading = true;
     });
 
@@ -267,6 +321,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
       final documents = await _driveService!.fetchDriveFiles(
         _authService.authClient!,
+        forceReindex: forceReindex,
       );
 
       setState(() {
@@ -284,29 +339,18 @@ class _ChatScreenState extends State<ChatScreen> {
       await _vectorStore.addContents(documents);
       final totalCount = await _vectorStore.count;
 
-      final withEmbeddings = documents
-          .where((d) => d.embedding != null && d.embedding!.isNotEmpty)
-          .length;
-      final withoutEmbeddings = documents.length - withEmbeddings;
-
       setState(() {
         _messages.add('VoiceGuide: Indexed ${documents.length} Drive files');
-        if (withEmbeddings > 0) {
-          _messages.add('✅ $withEmbeddings with embeddings');
-        }
-        if (withoutEmbeddings > 0) {
-          _messages.add(
-            '⚠️ $withoutEmbeddings without embeddings (API quota/errors)',
-          );
-        }
         _messages.add('Total stored: $totalCount items');
         for (final doc in documents.take(3)) {
-          final hasEmbedding =
-              doc.embedding != null && doc.embedding!.isNotEmpty;
-          _messages.add('📄 ${doc.title} ${hasEmbedding ? "✅" : "⚠️"}');
+          _messages.add('📄 ${doc.title}');
         }
+        _messages.add('Starting background embedding generation...');
         _isLoading = false;
       });
+
+      // Start background embedding generation
+      _generateMissingEmbeddings();
     } catch (e) {
       setState(() {
         _messages.add('VoiceGuide: Error indexing Drive files: $e');
@@ -381,7 +425,10 @@ class _ChatScreenState extends State<ChatScreen> {
           prefs.getString('embedding_model') ?? 'gemini-embedding-001';
       final model = GenerativeModel(model: embeddingModel, apiKey: _apiKey!);
 
-      final queryEmbedding = await model.embedContent(Content.text(query));
+      final queryEmbedding = await model.embedContent(
+        Content.text(query),
+        taskType: TaskType.retrievalQuery,
+      );
 
       // Search vector store for similar content
       final results = await _vectorStore.searchSimilar(
@@ -391,8 +438,59 @@ class _ChatScreenState extends State<ChatScreen> {
 
       return results;
     } catch (e) {
-      print('Error searching content: $e');
+      SimpleLogger.log('Error searching content: $e');
       return [];
+    }
+  }
+
+  void _generateMissingEmbeddings() async {
+    try {
+      final allContents = await _vectorStore.getAllContents();
+      final missingEmbeddings = allContents
+          .where((c) => c.embedding == null || c.embedding!.isEmpty)
+          .toList();
+
+      if (missingEmbeddings.isEmpty) {
+        setState(() {
+          _messages.add('✅ All content already has embeddings');
+        });
+        return;
+      }
+
+      setState(() {
+        _messages.add(
+          '🔄 Generating embeddings for ${missingEmbeddings.length} items...',
+        );
+      });
+
+      // Content is already chunked from Drive service, so just use it directly
+      final textsToEmbed = missingEmbeddings.map((e) => e.content).toList();
+      final embeddingService = EmbeddingService(_apiKey!);
+
+      await embeddingService.generateEmbeddingsBatch(
+        textsToEmbed,
+        missingEmbeddings,
+      );
+
+      // Update the vector store with new embeddings
+      await _vectorStore.addContents(missingEmbeddings);
+
+      final withEmbeddings = missingEmbeddings
+          .where((e) => e.embedding != null && e.embedding!.isNotEmpty)
+          .length;
+
+      setState(() {
+        _messages.add('✅ Generated embeddings for $withEmbeddings items');
+        if (withEmbeddings < missingEmbeddings.length) {
+          _messages.add(
+            '⚠️ ${missingEmbeddings.length - withEmbeddings} items still missing embeddings (quota limits)',
+          );
+        }
+      });
+    } catch (e) {
+      setState(() {
+        _messages.add('❌ Background embedding generation failed: $e');
+      });
     }
   }
 

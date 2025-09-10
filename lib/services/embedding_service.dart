@@ -5,18 +5,19 @@ import 'simple_logger.dart';
 
 class EmbeddingService {
   final String _apiKey;
-  late final GenerativeModel _embeddingModel;
+  GenerativeModel? _embeddingModel;
   static const int _maxContentLength = 20000;
 
-  EmbeddingService(this._apiKey) {
-    _initEmbeddingModel();
-  }
+  EmbeddingService(this._apiKey);
 
-  void _initEmbeddingModel() async {
+  Future<GenerativeModel> _getEmbeddingModel() async {
+    if (_embeddingModel != null) return _embeddingModel!;
+
     final prefs = await SharedPreferences.getInstance();
     final modelName =
         prefs.getString('embedding_model') ?? 'gemini-embedding-001';
     _embeddingModel = GenerativeModel(model: modelName, apiKey: _apiKey);
+    return _embeddingModel!;
   }
 
   List<String> chunkText(String text) {
@@ -57,64 +58,162 @@ class EmbeddingService {
     List<String> texts,
     List<ContentEntity> entities,
   ) async {
+    if (texts.isEmpty) return;
+
+    const maxTokensPerMinute = 25000; // Conservative limit (API limit is 30k)
+    const maxBatchSize = 500; // Stay under 20MB limit
+    
+    int tokensUsedThisMinute = 0;
+    DateTime minuteStartTime = DateTime.now();
+    
+    List<String> batchTexts = [];
+    List<ContentEntity> batchEntities = [];
+    int batchTokenCount = 0;
+    
+    for (int i = 0; i < texts.length; i++) {
+      final estimatedTokens = (texts[i].length / 4).round();
+      
+      // Check if we need to wait for next minute window
+      final now = DateTime.now();
+      if (now.difference(minuteStartTime).inMinutes >= 1) {
+        // Reset minute window
+        tokensUsedThisMinute = 0;
+        minuteStartTime = now;
+      }
+      
+      // If adding this batch would exceed minute limit, wait
+      if (tokensUsedThisMinute + batchTokenCount + estimatedTokens > maxTokensPerMinute) {
+        // Process current batch first if it has items
+        if (batchTexts.isNotEmpty) {
+          SimpleLogger.log('Processing batch: ${batchTexts.length} items, ~$batchTokenCount tokens');
+          await _processBatch(batchTexts, batchEntities);
+          tokensUsedThisMinute += batchTokenCount;
+          
+          // Reset batch
+          batchTexts = [];
+          batchEntities = [];
+          batchTokenCount = 0;
+        }
+        
+        // Wait for next minute window
+        final waitTime = 60 - now.difference(minuteStartTime).inSeconds;
+        if (waitTime > 0) {
+          SimpleLogger.log('Token limit reached. Waiting ${waitTime}s for next minute window...');
+          await Future.delayed(Duration(seconds: waitTime));
+          tokensUsedThisMinute = 0;
+          minuteStartTime = DateTime.now();
+        }
+      }
+      
+      // If batch size limit reached, process batch
+      if (batchTexts.length >= maxBatchSize) {
+        SimpleLogger.log('Processing batch: ${batchTexts.length} items, ~$batchTokenCount tokens');
+        await _processBatch(batchTexts, batchEntities);
+        tokensUsedThisMinute += batchTokenCount;
+        
+        // Reset batch
+        batchTexts = [];
+        batchEntities = [];
+        batchTokenCount = 0;
+      }
+      
+      // Add current item to batch
+      batchTexts.add(texts[i]);
+      batchEntities.add(entities[i]);
+      batchTokenCount += estimatedTokens;
+    }
+    
+    // Process final batch if any items remain
+    if (batchTexts.isNotEmpty) {
+      SimpleLogger.log('Processing final batch: ${batchTexts.length} items, ~$batchTokenCount tokens');
+      await _processBatch(batchTexts, batchEntities);
+    }
+  }
+  
+  Future<void> _processBatch(
+    List<String> texts,
+    List<ContentEntity> entities,
+  ) async {
+    try {
+      final model = await _getEmbeddingModel();
+      final requests = texts
+          .map(
+            (text) => EmbedContentRequest(
+              Content.text(text),
+              taskType: TaskType.retrievalDocument,
+            ),
+          )
+          .toList();
+      final response = await model.batchEmbedContents(requests);
+
+      // Assign embeddings to entities
+      for (
+        int i = 0;
+        i < response.embeddings.length && i < entities.length;
+        i++
+      ) {
+        entities[i].embedding = response.embeddings[i].values;
+      }
+
+      SimpleLogger.log(
+        'Batch embedding completed: ${response.embeddings.length} embeddings generated',
+      );
+    } catch (e) {
+      SimpleLogger.log('Batch embedding failed: $e');
+
+      // Fallback to individual embedding generation
+      SimpleLogger.log('Falling back to individual embedding generation...');
+      await _generateEmbeddingsIndividually(texts, entities);
+    }
+  }
+
+  Future<void> _generateEmbeddingsIndividually(
+    List<String> texts,
+    List<ContentEntity> entities,
+  ) async {
     int successCount = 0;
     int failCount = 0;
     bool quotaExceeded = false;
     final maxRequests = await _maxConcurrentRequests;
     final rateLimitDelay = await _rateLimitDelay;
 
-    // Group chunks by original entity to keep them together
-    final entityGroups = <String, List<int>>{};
-    for (int i = 0; i < entities.length; i++) {
-      final baseId = entities[i].sourceId.split('_chunk_')[0];
-      entityGroups[baseId] ??= [];
-      entityGroups[baseId]!.add(i);
-    }
-
-    final allIndices = <int>[];
-    for (final group in entityGroups.values) {
-      allIndices.addAll(group);
-    }
-
     for (
       int batchStart = 0;
-      batchStart < allIndices.length && !quotaExceeded;
+      batchStart < texts.length && !quotaExceeded;
       batchStart += maxRequests
     ) {
-      final batchEnd = (batchStart + maxRequests).clamp(0, allIndices.length);
-      final batchIndices = allIndices.sublist(batchStart, batchEnd);
+      final batchEnd = (batchStart + maxRequests).clamp(0, texts.length);
+      final batchTexts = texts.sublist(batchStart, batchEnd);
+      final batchEntities = entities.sublist(batchStart, batchEnd);
 
-      final futures = batchIndices.map(
-        (i) => _generateSingleEmbedding(texts[i], i),
+      final futures = List.generate(
+        batchTexts.length,
+        (i) => _generateSingleEmbedding(batchTexts[i], batchStart + i),
       );
       final results = await Future.wait(futures, eagerError: false);
 
-      for (int j = 0; j < results.length; j++) {
-        final i = batchIndices[j];
-        final result = results[j];
-
+      for (int i = 0; i < results.length; i++) {
+        final result = results[i];
         if (result.success) {
-          entities[i].embedding = result.embedding;
+          batchEntities[i].embedding = result.embedding;
           successCount++;
         } else {
-          entities[i].embedding = null;
+          batchEntities[i].embedding = null;
           failCount++;
-
           if (result.isQuotaError) {
-            SimpleLogger.log('Quota exceeded, stopping embedding generation');
             quotaExceeded = true;
             break;
           }
         }
       }
 
-      if (batchEnd < allIndices.length && !quotaExceeded) {
+      if (batchEnd < texts.length && !quotaExceeded) {
         await Future.delayed(rateLimitDelay);
       }
     }
 
     SimpleLogger.log(
-      'Embedding results: $successCount success, $failCount failed',
+      'Individual embedding results: $successCount success, $failCount failed',
     );
   }
 
@@ -134,7 +233,11 @@ class EmbeddingService {
     int index,
   ) async {
     try {
-      final response = await _embeddingModel.embedContent(Content.text(text));
+      final model = await _getEmbeddingModel();
+      final response = await model.embedContent(
+        Content.text(text),
+        taskType: TaskType.retrievalDocument,
+      );
       return EmbeddingResult(
         success: true,
         embedding: response.embedding.values,

@@ -16,13 +16,11 @@ class AuthService {
   GoogleSignIn? _googleSignIn;
   auth.AuthClient? _authClient;
   GoogleSignInAccount? _currentUser;
-  String? _clientId;
 
   auth.AuthClient? get authClient => _authClient;
   bool get isAuthenticated => _currentUser != null;
 
   Future<void> checkExistingAuth(String clientId) async {
-    _clientId = clientId;
     _googleSignIn ??= GoogleSignIn(clientId: clientId, scopes: _scopes);
 
     // Check stored auth state first
@@ -52,7 +50,6 @@ class AuthService {
   }
 
   Future<bool> signIn(String clientId) async {
-    _clientId = clientId;
     _googleSignIn ??= GoogleSignIn(clientId: clientId, scopes: _scopes);
     try {
       _currentUser = await _googleSignIn!.signIn();

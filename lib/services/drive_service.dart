@@ -38,12 +38,17 @@ class DriveService {
     _embeddingService = EmbeddingService(_apiKey);
   }
 
-  Future<List<ContentEntity>> fetchDriveFiles(AuthClient authClient) async {
+  Future<List<ContentEntity>> fetchDriveFiles(
+    AuthClient authClient, {
+    bool forceReindex = false,
+  }) async {
     final drive = DriveApi(authClient);
 
     // Get last sync time
     final prefs = await SharedPreferences.getInstance();
-    final lastSyncTime = prefs.getInt('drive_last_sync_time');
+    final lastSyncTime = forceReindex
+        ? null
+        : prefs.getInt('drive_last_sync_time');
     final modifiedTime = lastSyncTime != null
         ? DateTime.fromMillisecondsSinceEpoch(lastSyncTime).toIso8601String()
         : null;
@@ -65,21 +70,48 @@ class DriveService {
 
     SimpleLogger.log('Found ${fileList.files?.length ?? 0} files');
     final documents = <ContentEntity>[];
-    final textsToEmbed = <String>[];
-    final documentsForEmbedding = <ContentEntity>[];
+    final maxConcurrency = prefs.getInt('max_concurrent_requests') ?? 3;
 
-    // Process files and extract content
-    for (final file in fileList.files ?? []) {
-      if (file.id == null || file.name == null) continue;
+    // Process files in parallel batches
+    final validFiles = (fileList.files ?? [])
+        .where((file) => file.id != null && file.name != null)
+        .where((file) => _supportedMimeTypes.contains(file.mimeType))
+        .toList();
 
-      // Skip unsupported file types
-      if (!_supportedMimeTypes.contains(file.mimeType)) {
-        SimpleLogger.log(
-          'Skipping unsupported file: ${file.name} (${file.mimeType})',
-        );
-        continue;
+    for (int i = 0; i < validFiles.length; i += maxConcurrency) {
+      final batch = validFiles.skip(i).take(maxConcurrency).toList();
+      final batchResults = await Future.wait(
+        batch.map((file) => _processFileWithEmbedding(drive, file, authClient)),
+        eagerError: false,
+      );
+
+      for (final result in batchResults) {
+        if (result != null) documents.addAll(result);
       }
+      
+      // Rate limiting between batches
+      if (i + maxConcurrency < validFiles.length) {
+        final rateLimitSeconds = prefs.getInt('rate_limit_seconds') ?? 15;
+        SimpleLogger.log('Rate limiting: waiting ${rateLimitSeconds}s before next batch');
+        await Future.delayed(Duration(seconds: rateLimitSeconds));
+      }
+    }
 
+    // Update last sync time only if we actually processed files
+    if (fileList.files?.isNotEmpty == true) {
+      final currentTime = DateTime.now().millisecondsSinceEpoch;
+      await prefs.setInt('drive_last_sync_time', currentTime);
+    }
+
+    return documents;
+  }
+
+  Future<List<ContentEntity>?> _processFileWithEmbedding(
+    DriveApi drive,
+    File file,
+    AuthClient authClient,
+  ) async {
+    try {
       // Skip files that are too large
       final fileSize = int.tryParse(file.size ?? '0') ?? 0;
       final maxSize = await _maxFileSizeBytes;
@@ -87,24 +119,24 @@ class DriveService {
         SimpleLogger.log(
           'Skipping large file: ${file.name} (${(fileSize / 1024 / 1024).toStringAsFixed(1)}MB)',
         );
-        continue;
+        return null;
       }
 
       SimpleLogger.log('Processing file: ${file.name} (${file.mimeType})');
       final content = await _extractFileContent(drive, file, authClient);
       if (content.isEmpty) {
         SimpleLogger.log('No content extracted from ${file.name}');
-        continue;
+        return null;
       }
 
       // Check content size after extraction
-      final contentSizeBytes = content.length * 2; // Approximate UTF-16 size
+      final contentSizeBytes = content.length * 2;
       final maxContentSize = await _maxFileSizeBytes;
       if (contentSizeBytes > maxContentSize) {
         SimpleLogger.log(
           'Skipping large content: ${file.name} (${(contentSizeBytes / 1024 / 1024).toStringAsFixed(1)}MB extracted)',
         );
-        continue;
+        return null;
       }
 
       SimpleLogger.log(
@@ -126,28 +158,34 @@ class DriveService {
         fullText,
       );
 
-      for (final chunkDoc in chunkEntities) {
-        textsToEmbed.add(chunkDoc.content);
-        documentsForEmbedding.add(chunkDoc);
-        documents.add(chunkDoc);
-      }
+      // Store content immediately without embeddings
+      return chunkEntities;
+    } catch (e) {
+      SimpleLogger.log('Error processing file ${file.name}: $e');
+      return null;
     }
+  }
 
-    // Generate embeddings
-    await _embeddingService.generateEmbeddingsBatch(
-      textsToEmbed,
-      documentsForEmbedding,
-    );
-
-    // Update last sync time
-    if (documents.isNotEmpty) {
-      final latestTime = documents
-          .map((d) => d.createdDate.millisecondsSinceEpoch)
-          .reduce((a, b) => a > b ? a : b);
-      await prefs.setInt('drive_last_sync_time', latestTime);
+  Future<void> generateMissingEmbeddings() async {
+    SimpleLogger.log('Starting background embedding generation...');
+    
+    try {
+      final textsToEmbed = <String>[];
+      final entitiesToEmbed = <ContentEntity>[];
+      
+      // This would need to be called with a vector store instance
+      // For now, this is a placeholder - the actual implementation
+      // will be in main.dart where we have access to the vector store
+      
+      await _embeddingService.generateEmbeddingsBatch(
+        textsToEmbed,
+        entitiesToEmbed,
+      );
+      
+      SimpleLogger.log('Background embedding generation completed');
+    } catch (e) {
+      SimpleLogger.log('Background embedding generation failed: $e');
     }
-
-    return documents;
   }
 
   Future<String> _extractFileContent(
