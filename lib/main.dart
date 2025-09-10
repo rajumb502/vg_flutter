@@ -46,9 +46,25 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
+enum MessageType { userQuery, llmResponse, systemMessage }
+
+class ChatMessage {
+  final String content;
+  final bool isUser;
+  final MessageType type;
+  final DateTime timestamp;
+
+  ChatMessage({
+    required this.content,
+    required this.isUser,
+    required this.type,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
+
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _controller = TextEditingController();
-  final List<String> _messages = [];
+  final List<ChatMessage> _messages = [];
   GenerativeModel? _model;
   bool _isLoading = false;
   String? _apiKey;
@@ -58,10 +74,14 @@ class _ChatScreenState extends State<ChatScreen> {
   DriveService? _driveService;
   late final VectorStore _vectorStore;
 
+  String _sessionId = '';
+  int _conversationCount = 0;
+
   @override
   void initState() {
     super.initState();
     _vectorStore = VectorStoreFactory.getInstance();
+    _sessionId = DateTime.now().millisecondsSinceEpoch.toString();
     _loadApiKey();
     _checkExistingAuth();
   }
@@ -103,7 +123,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _controller.clear();
 
     setState(() {
-      _messages.add('You: $userMessage');
+      _messages.add(
+        ChatMessage(
+          content: userMessage,
+          isUser: true,
+          type: MessageType.userQuery,
+        ),
+      );
       _isLoading = true;
     });
 
@@ -113,29 +139,130 @@ class _ChatScreenState extends State<ChatScreen> {
 
       // Build context from relevant content
       final contextText = relevantContent.isNotEmpty
-          ? 'Relevant information from your emails and documents:\n${relevantContent.cast<ContentEntity>().map((c) => '- ${c.title}: ${c.content.substring(0, 200)}...').join('\n')}\n\n'
+          ? 'Relevant information from your emails and documents:\n${relevantContent.cast<ContentEntity>().map((c) => '- ${c.title}: ${_extractRelevantPortion(c.content, userMessage)}...').join('\n')}\n\n'
+          : '';
+
+      // Build conversation context from recent messages
+      final conversationMessages = _messages
+          .where((m) => m.type != MessageType.systemMessage)
+          .toList();
+      final recentMessages = conversationMessages.length > 6
+          ? conversationMessages.skip(conversationMessages.length - 6)
+          : conversationMessages;
+      final conversationContext = recentMessages
+          .map((m) => '${m.isUser ? "User" : "VoiceGuide"}: ${m.content}')
+          .join('\n');
+
+      final contextPrefix = conversationContext.isNotEmpty
+          ? 'Recent conversation:\n$conversationContext\n\n'
           : '';
 
       final response = await _model!.generateContent([
         Content.text(
-          '${contextText}You are VoiceGuide, an AI assistant for people with visual disabilities. Help with their goals in a simple, clear way. User says: $userMessage',
+          '$contextText${contextPrefix}You are VoiceGuide, an AI assistant for people with visual disabilities. Help with their goals in a simple, clear way. Maintain conversation context and refer to previous exchanges when relevant. User says: $userMessage',
         ),
       ]);
 
+      final aiResponse = response.text ?? "I'm sorry, I couldn't process that.";
+
       setState(() {
         _messages.add(
-          'VoiceGuide: ${response.text ?? "I'm sorry, I couldn't process that."}',
+          ChatMessage(
+            content: aiResponse,
+            isUser: false,
+            type: MessageType.llmResponse,
+          ),
         );
         _isLoading = false;
       });
+
+      // Store conversation pair
+      _saveConversationPair(userMessage, aiResponse);
     } catch (e) {
+      const errorResponse = 'Sorry, I encountered an error. Please try again.';
+
       setState(() {
         _messages.add(
-          'VoiceGuide: Sorry, I encountered an error. Please try again.',
+          ChatMessage(
+            content: errorResponse,
+            isUser: false,
+            type: MessageType.llmResponse,
+          ),
         );
         _isLoading = false;
       });
+
+      // Store conversation pair even for errors
+      _saveConversationPair(userMessage, errorResponse);
     }
+  }
+
+  Widget _buildChatBubble(ChatMessage message) {
+    if (message.type == MessageType.systemMessage) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 16),
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.orange[100],
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              message.content,
+              style: TextStyle(fontSize: 14, color: Colors.orange[800]),
+              textAlign: TextAlign.left,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+      child: Row(
+        mainAxisAlignment: message.isUser
+            ? MainAxisAlignment.end
+            : MainAxisAlignment.start,
+        children: [
+          if (!message.isUser) ...[
+            const CircleAvatar(
+              radius: 16,
+              backgroundColor: Colors.blue,
+              child: Icon(Icons.smart_toy, color: Colors.white, size: 16),
+            ),
+            const SizedBox(width: 8),
+          ],
+          Flexible(
+            child: Container(
+              constraints: BoxConstraints(
+                maxWidth: MediaQuery.of(context).size.width * 0.75,
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: message.isUser ? Colors.blue[600] : Colors.grey[200],
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                message.content,
+                style: TextStyle(
+                  fontSize: 16,
+                  color: message.isUser ? Colors.white : Colors.black87,
+                ),
+              ),
+            ),
+          ),
+          if (message.isUser) ...[
+            const SizedBox(width: 8),
+            const CircleAvatar(
+              radius: 16,
+              backgroundColor: Colors.green,
+              child: Icon(Icons.person, color: Colors.white, size: 16),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   @override
@@ -146,14 +273,20 @@ class _ChatScreenState extends State<ChatScreen> {
         actions: [
           // Vector store button - always visible (local content)
           IconButton(onPressed: _viewStore, icon: const Icon(Icons.storage)),
-          
+
           if (!_authService.isAuthenticated)
             IconButton(
               onPressed: () async {
                 final success = await _authService.signIn(googleClientId);
                 if (success) {
                   setState(() {});
-                  _messages.add('VoiceGuide: Connected to Google services!');
+                  _messages.add(
+                    ChatMessage(
+                      content: 'Connected to Google services!',
+                      isUser: false,
+                      type: MessageType.systemMessage,
+                    ),
+                  );
                 }
               },
               icon: const Icon(Icons.login),
@@ -182,14 +315,14 @@ class _ChatScreenState extends State<ChatScreen> {
               icon: const Icon(Icons.logout),
             ),
           ],
-          
+
           // Generate embeddings button - visible when API key is set
           if (_apiKey != null)
             IconButton(
               onPressed: _generateMissingEmbeddings,
               icon: const Icon(Icons.auto_fix_high),
             ),
-            
+
           IconButton(
             onPressed: () => Navigator.push(
               context,
@@ -206,13 +339,8 @@ class _ChatScreenState extends State<ChatScreen> {
               padding: const EdgeInsets.all(16),
               itemCount: _messages.length,
               itemBuilder: (context, index) {
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Text(
-                    _messages[index],
-                    style: const TextStyle(fontSize: 16),
-                  ),
-                );
+                final message = _messages[index];
+                return _buildChatBubble(message);
               },
             ),
           ),
@@ -250,41 +378,76 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _viewStore() async {
-    final contents = await _vectorStore.getAllContents();
-    final count = await _vectorStore.count;
-    final withEmbeddings = contents.where((c) => c.embedding != null && c.embedding!.isNotEmpty).length;
-    final withoutEmbeddings = contents.where((c) => c.embedding == null || c.embedding!.isEmpty).toList();
+    try {
+      final contents = await _vectorStore.getAllContents();
 
-    setState(() {
-      _messages.add('📦 Vector Store Contents: $count items');
-      _messages.add('✅ With embeddings: $withEmbeddings');
-      _messages.add('❌ Without embeddings: ${withoutEmbeddings.length}');
-      
+      final count = await _vectorStore.count;
+      final withEmbeddings = contents
+          .where((c) => c.embedding != null && c.embedding!.isNotEmpty)
+          .length;
+      final withoutEmbeddings = contents
+          .where((c) => c.embedding == null || c.embedding!.isEmpty)
+          .toList();
+
+      final storeInfo = StringBuffer();
+      storeInfo.writeln('📦 Vector Store Contents: $count items');
+      storeInfo.writeln('✅ With embeddings: $withEmbeddings');
+      storeInfo.writeln('❌ Without embeddings: ${withoutEmbeddings.length}');
+
       if (contents.isEmpty) {
-        _messages.add('Store is empty. Index some emails first!');
+        storeInfo.writeln('Store is empty. Index some emails first!');
       } else {
-        _messages.add('\n--- Sample Contents ---');
+        storeInfo.writeln('\n--- Sample Contents ---');
         for (final content in contents.take(5)) {
-          final hasEmbedding = content.embedding != null && content.embedding!.isNotEmpty;
-          _messages.add('📄 ${content.title} (${content.contentType.name}) - ${hasEmbedding ? "✅" : "❌"}');
+          final hasEmbedding =
+              content.embedding != null && content.embedding!.isNotEmpty;
+          final title = content.title;
+          final contentType = content.contentType.name;
+          storeInfo.writeln(
+            '📄 $title ($contentType) - ${hasEmbedding ? "✅" : "❌"}',
+          );
         }
         if (contents.length > 5) {
-          _messages.add('... and ${contents.length - 5} more items');
+          storeInfo.writeln('... and ${contents.length - 5} more items');
         }
-        
+
         if (withoutEmbeddings.isNotEmpty) {
-          _messages.add('\n--- Missing Embeddings (with sizes) ---');
+          storeInfo.writeln('\n--- Missing Embeddings (with sizes) ---');
           for (final content in withoutEmbeddings.take(10)) {
-            final sizeKB = (content.content.length / 1024).toStringAsFixed(1);
-            final tokens = (content.content.length / 4).round(); // Rough estimate: 4 chars per token
-            _messages.add('❌ ${content.title}: ${sizeKB}KB (~$tokens tokens)');
+            final contentText = content.content;
+            final sizeKB = (contentText.length / 1024).toStringAsFixed(1);
+            final tokens = (contentText.length / 3).round();
+            final title = content.title;
+            storeInfo.writeln('❌ $title: ${sizeKB}KB (~$tokens tokens)');
           }
           if (withoutEmbeddings.length > 10) {
-            _messages.add('... and ${withoutEmbeddings.length - 10} more without embeddings');
+            storeInfo.writeln(
+              '... and ${withoutEmbeddings.length - 10} more without embeddings',
+            );
           }
         }
       }
-    });
+
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            content: storeInfo.toString(),
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
+      });
+    } catch (e) {
+      setState(() {
+        _messages.add(
+          ChatMessage(
+            content: 'Error viewing store: $e',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
+      });
+    }
   }
 
   void _indexDriveForce() async {
@@ -299,7 +462,11 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_driveService == null || _authService.authClient == null) {
       setState(() {
         _messages.add(
-          'VoiceGuide: Please sign in first and ensure API key is set.',
+          ChatMessage(
+            content: 'Please sign in first and ensure API key is set.',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
         );
       });
       return;
@@ -307,16 +474,26 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       _messages.add(
-        forceReindex
-            ? 'VoiceGuide: Force re-indexing all Drive files...'
-            : 'VoiceGuide: Indexing Drive files...',
+        ChatMessage(
+          content: forceReindex
+              ? 'Force re-indexing all Drive files...'
+              : 'Indexing Drive files...',
+          isUser: false,
+          type: MessageType.systemMessage,
+        ),
       );
       _isLoading = true;
     });
 
     try {
       setState(() {
-        _messages.add('VoiceGuide: Fetching file list from Drive...');
+        _messages.add(
+          ChatMessage(
+            content: 'Fetching file list from Drive...',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
       });
 
       final documents = await _driveService!.fetchDriveFiles(
@@ -325,12 +502,24 @@ class _ChatScreenState extends State<ChatScreen> {
       );
 
       setState(() {
-        _messages.add('VoiceGuide: Found ${documents.length} files to process');
+        _messages.add(
+          ChatMessage(
+            content: 'Found ${documents.length} files to process',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
       });
 
       if (documents.isEmpty) {
         setState(() {
-          _messages.add('VoiceGuide: No new files found since last sync');
+          _messages.add(
+            ChatMessage(
+              content: 'No new files found since last sync',
+              isUser: false,
+              type: MessageType.systemMessage,
+            ),
+          );
           _isLoading = false;
         });
         return;
@@ -339,13 +528,22 @@ class _ChatScreenState extends State<ChatScreen> {
       await _vectorStore.addContents(documents);
       final totalCount = await _vectorStore.count;
 
+      final indexInfo = StringBuffer();
+      indexInfo.writeln('Indexed ${documents.length} Drive files');
+      indexInfo.writeln('Total stored: $totalCount items');
+      for (final doc in documents.take(3)) {
+        indexInfo.writeln('📄 ${doc.title}');
+      }
+      indexInfo.writeln('Starting background embedding generation...');
+
       setState(() {
-        _messages.add('VoiceGuide: Indexed ${documents.length} Drive files');
-        _messages.add('Total stored: $totalCount items');
-        for (final doc in documents.take(3)) {
-          _messages.add('📄 ${doc.title}');
-        }
-        _messages.add('Starting background embedding generation...');
+        _messages.add(
+          ChatMessage(
+            content: indexInfo.toString(),
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
         _isLoading = false;
       });
 
@@ -353,7 +551,13 @@ class _ChatScreenState extends State<ChatScreen> {
       _generateMissingEmbeddings();
     } catch (e) {
       setState(() {
-        _messages.add('VoiceGuide: Error indexing Drive files: $e');
+        _messages.add(
+          ChatMessage(
+            content: 'Error indexing Drive files: $e',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
         _isLoading = false;
       });
     }
@@ -363,14 +567,24 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_emailService == null || _authService.authClient == null) {
       setState(() {
         _messages.add(
-          'VoiceGuide: Please sign in first and ensure API key is set.',
+          ChatMessage(
+            content: 'Please sign in first and ensure API key is set.',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
         );
       });
       return;
     }
 
     setState(() {
-      _messages.add('VoiceGuide: Indexing emails...');
+      _messages.add(
+        ChatMessage(
+          content: 'Indexing emails...',
+          isUser: false,
+          type: MessageType.systemMessage,
+        ),
+      );
       _isLoading = true;
     });
 
@@ -387,36 +601,51 @@ class _ChatScreenState extends State<ChatScreen> {
           .length;
       final withoutEmbeddings = emails.length - withEmbeddings;
 
+      final emailInfo = StringBuffer();
+      emailInfo.writeln('Indexed ${emails.length} emails');
+      if (withEmbeddings > 0) {
+        emailInfo.writeln('✅ $withEmbeddings with embeddings');
+      }
+      if (withoutEmbeddings > 0) {
+        emailInfo.writeln(
+          '⚠️ $withoutEmbeddings without embeddings (API quota/errors)',
+        );
+      }
+      emailInfo.writeln('Total stored: $totalCount items');
+      for (final email in emails.take(3)) {
+        final hasEmbedding =
+            email.embedding != null && email.embedding!.isNotEmpty;
+        emailInfo.writeln(
+          '📧 ${email.title} from ${email.author} ${hasEmbedding ? "✅" : "⚠️"}',
+        );
+      }
+
       setState(() {
-        _messages.add('VoiceGuide: Indexed ${emails.length} emails');
-        if (withEmbeddings > 0) {
-          _messages.add('✅ $withEmbeddings with embeddings');
-        }
-        if (withoutEmbeddings > 0) {
-          _messages.add(
-            '⚠️ $withoutEmbeddings without embeddings (API quota/errors)',
-          );
-        }
-        _messages.add('Total stored: $totalCount items');
-        for (final email in emails.take(3)) {
-          final hasEmbedding =
-              email.embedding != null && email.embedding!.isNotEmpty;
-          _messages.add(
-            '📧 ${email.title} from ${email.author} ${hasEmbedding ? "✅" : "⚠️"}',
-          );
-        }
+        _messages.add(
+          ChatMessage(
+            content: emailInfo.toString(),
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
         _isLoading = false;
       });
     } catch (e) {
       setState(() {
-        _messages.add('VoiceGuide: Error indexing emails: $e');
+        _messages.add(
+          ChatMessage(
+            content: 'Error indexing emails: $e',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
         _isLoading = false;
       });
     }
   }
 
   Future<List<ContentEntity>> _searchRelevantContent(String query) async {
-    if (_emailService == null) return [];
+    if (_apiKey == null) return [];
 
     try {
       // Generate embedding for the user query
@@ -430,13 +659,23 @@ class _ChatScreenState extends State<ChatScreen> {
         taskType: TaskType.retrievalQuery,
       );
 
-      // Search vector store for similar content
+      // Search vector store for similar content (including chat history)
       final results = await _vectorStore.searchSimilar(
         queryEmbedding.embedding.values,
-        limit: 3,
+        limit: 5, // Increased to include chat history
       );
 
-      return results;
+      // Prioritize recent chat history for context
+      final chatHistory = results
+          .where((r) => r.contentType == ContentType.chatHistory)
+          .take(2)
+          .toList();
+      final otherContent = results
+          .where((r) => r.contentType != ContentType.chatHistory)
+          .take(3)
+          .toList();
+
+      return [...chatHistory, ...otherContent];
     } catch (e) {
       SimpleLogger.log('Error searching content: $e');
       return [];
@@ -452,14 +691,25 @@ class _ChatScreenState extends State<ChatScreen> {
 
       if (missingEmbeddings.isEmpty) {
         setState(() {
-          _messages.add('✅ All content already has embeddings');
+          _messages.add(
+            ChatMessage(
+              content: '✅ All content already has embeddings',
+              isUser: false,
+              type: MessageType.systemMessage,
+            ),
+          );
         });
         return;
       }
 
       setState(() {
         _messages.add(
-          '🔄 Generating embeddings for ${missingEmbeddings.length} items...',
+          ChatMessage(
+            content:
+                '🔄 Generating embeddings for ${missingEmbeddings.length} items...',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
         );
       });
 
@@ -479,19 +729,149 @@ class _ChatScreenState extends State<ChatScreen> {
           .where((e) => e.embedding != null && e.embedding!.isNotEmpty)
           .length;
 
+      final embeddingInfo = StringBuffer();
+      embeddingInfo.writeln('✅ Generated embeddings for $withEmbeddings items');
+      if (withEmbeddings < missingEmbeddings.length) {
+        embeddingInfo.writeln(
+          '⚠️ ${missingEmbeddings.length - withEmbeddings} items still missing embeddings (quota limits)',
+        );
+      }
+
       setState(() {
-        _messages.add('✅ Generated embeddings for $withEmbeddings items');
-        if (withEmbeddings < missingEmbeddings.length) {
-          _messages.add(
-            '⚠️ ${missingEmbeddings.length - withEmbeddings} items still missing embeddings (quota limits)',
-          );
-        }
+        _messages.add(
+          ChatMessage(
+            content: embeddingInfo.toString(),
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
       });
     } catch (e) {
       setState(() {
-        _messages.add('❌ Background embedding generation failed: $e');
+        _messages.add(
+          ChatMessage(
+            content: '❌ Background embedding generation failed: $e',
+            isUser: false,
+            type: MessageType.systemMessage,
+          ),
+        );
       });
     }
+  }
+
+  String _extractRelevantPortion(String content, String query) {
+    const maxTokens = 500; // ~1500 characters at 3 chars per token
+    const maxChars = maxTokens * 3;
+
+    if (content.length <= maxChars) return content;
+
+    // Find query words in content
+    final queryWords = query
+        .toLowerCase()
+        .split(' ')
+        .where((w) => w.length > 2)
+        .toList();
+    final contentLower = content.toLowerCase();
+
+    int bestStart = 0;
+    int maxMatches = 0;
+
+    // Sliding window to find portion with most query word matches
+    for (int i = 0; i <= content.length - maxChars; i += 100) {
+      final window = contentLower.substring(
+        i,
+        (i + maxChars).clamp(0, content.length),
+      );
+      int matches = 0;
+
+      for (final word in queryWords) {
+        if (window.contains(word)) matches++;
+      }
+
+      if (matches > maxMatches) {
+        maxMatches = matches;
+        bestStart = i;
+      }
+    }
+
+    // Extract the most relevant portion
+    final endPos = (bestStart + maxChars).clamp(0, content.length);
+    return content.substring(bestStart, endPos);
+  }
+
+  void _saveConversationPair(String userQuery, String aiResponse) async {
+    try {
+      // Generate summary for better search
+      final summary = await _generateConversationSummary(userQuery, aiResponse);
+
+      final chatEntity = ContentEntity.create(
+        sourceId: '${_sessionId}_${_conversationCount++}',
+        title:
+            'Chat: ${userQuery.length > 50 ? '${userQuery.substring(0, 50)}...' : userQuery}',
+        content: summary,
+        createdDate: DateTime.now(),
+        contentType: ContentType.chatHistory,
+      );
+
+      await _vectorStore.addContents([chatEntity]);
+    } catch (e) {
+      // Fallback: store raw conversation if summary fails
+      final conversationContent = 'User: $userQuery\n\nVoiceGuide: $aiResponse';
+
+      final chatEntity = ContentEntity.create(
+        sourceId: '${_sessionId}_${_conversationCount++}',
+        title:
+            'Chat: ${userQuery.length > 50 ? '${userQuery.substring(0, 50)}...' : userQuery}',
+        content: conversationContent,
+        createdDate: DateTime.now(),
+        contentType: ContentType.chatHistory,
+      );
+
+      await _vectorStore.addContents([chatEntity]);
+    }
+  }
+
+  Future<String> _generateConversationSummary(
+    String userQuery,
+    String aiResponse,
+  ) async {
+    if (_model == null) {
+      return 'User asked: $userQuery\nTopic: ${_extractKeyTopics(userQuery, aiResponse)}';
+    }
+
+    try {
+      final summaryPrompt =
+          'Summarize this conversation in 2-3 sentences focusing on the user\'s goal and key information provided:\n\nUser: $userQuery\n\nAssistant: $aiResponse';
+
+      final response = await _model!.generateContent([
+        Content.text(summaryPrompt),
+      ]);
+      return response.text ??
+          'User asked: $userQuery\nTopic: ${_extractKeyTopics(userQuery, aiResponse)}';
+    } catch (e) {
+      return 'User asked: $userQuery\nTopic: ${_extractKeyTopics(userQuery, aiResponse)}';
+    }
+  }
+
+  String _extractKeyTopics(String userQuery, String aiResponse) {
+    final combined = '$userQuery $aiResponse'.toLowerCase();
+    final keywords = [
+      'job',
+      'email',
+      'document',
+      'file',
+      'search',
+      'help',
+      'find',
+      'create',
+      'write',
+      'read',
+    ];
+    final foundTopics = keywords
+        .where((k) => combined.contains(k))
+        .take(3)
+        .join(', ');
+    return foundTopics.isNotEmpty ? foundTopics : 'general assistance';
   }
 
   @override

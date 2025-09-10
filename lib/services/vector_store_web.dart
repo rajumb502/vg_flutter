@@ -123,7 +123,7 @@ class PersistentWebVectorStore extends VectorStore {
     return ContentEntity.create(
       sourceId: map['sourceId'] as String,
       title: map['title'] as String,
-      author: map['author'] as String,
+      author: (map['author'] ?? '') as String,
       content: map['content'] as String,
       createdDate: DateTime.fromMillisecondsSinceEpoch(
         map['createdDate'] as int,

@@ -4,6 +4,7 @@ enum ContentType {
   calendar,
   contact,
   note,
+  chatHistory,
 }
 
 class ContentEntity {

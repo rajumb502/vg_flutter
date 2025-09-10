@@ -6,6 +6,7 @@ enum ContentType {
   calendar,
   contact,
   note,
+  chatHistory,
 }
 
 @Entity()

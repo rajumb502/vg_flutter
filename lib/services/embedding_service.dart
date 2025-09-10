@@ -71,7 +71,7 @@ class EmbeddingService {
     int batchTokenCount = 0;
     
     for (int i = 0; i < texts.length; i++) {
-      final estimatedTokens = (texts[i].length / 4).round();
+      final estimatedTokens = (texts[i].length / 3).round();
       
       // Check if we need to wait for next minute window
       final now = DateTime.now();
