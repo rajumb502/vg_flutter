@@ -635,11 +635,28 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     try {
+      final countBefore = await _vectorStore.count;
       final emails = await _emailService!.fetchEmails(_authService.authClient!);
 
-      // Always store emails, even if embeddings failed
+      if (emails.isEmpty) {
+        setState(() {
+          _messages.add(
+            ChatMessage(
+              content: 'No new emails found since last sync',
+              isUser: false,
+              type: MessageType.systemMessage,
+            ),
+          );
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Store emails (duplicates will be filtered out)
       await _vectorStore.addContents(emails);
-      final totalCount = await _vectorStore.count;
+      final countAfter = await _vectorStore.count;
+      final newEmails = countAfter - countBefore;
+      final duplicates = emails.length - newEmails;
 
       // Count how many have embeddings
       final withEmbeddings = emails
@@ -648,7 +665,13 @@ class _ChatScreenState extends State<ChatScreen> {
       final withoutEmbeddings = emails.length - withEmbeddings;
 
       final emailInfo = StringBuffer();
-      emailInfo.writeln('Indexed ${emails.length} emails');
+      emailInfo.writeln('Found ${emails.length} emails from Gmail');
+      if (duplicates > 0) {
+        emailInfo.writeln('📋 $duplicates already indexed (skipped)');
+      }
+      if (newEmails > 0) {
+        emailInfo.writeln('✨ $newEmails new emails added');
+      }
       if (withEmbeddings > 0) {
         emailInfo.writeln('✅ $withEmbeddings with embeddings');
       }
@@ -657,7 +680,7 @@ class _ChatScreenState extends State<ChatScreen> {
           '⚠️ $withoutEmbeddings without embeddings (API quota/errors)',
         );
       }
-      emailInfo.writeln('Total stored: $totalCount items');
+      emailInfo.writeln('Total stored: $countAfter items');
       for (final email in emails.take(3)) {
         final hasEmbedding =
             email.embedding != null && email.embedding!.isNotEmpty;
@@ -945,6 +968,36 @@ class _ChatScreenState extends State<ChatScreen> {
     return foundTopics.isNotEmpty ? foundTopics : 'general assistance';
   }
 
+  Future<void> _executeWithAuth(String actionName, VoidCallback action) async {
+    if (!_authService.isAuthenticated) {
+      final success = await _authService.signIn(googleClientId);
+      if (success) {
+        setState(() {
+          _messages.add(
+            ChatMessage(
+              content: 'Connected to Google services! Now $actionName...',
+              isUser: false,
+              type: MessageType.systemMessage,
+            ),
+          );
+        });
+        action();
+      } else {
+        setState(() {
+          _messages.add(
+            ChatMessage(
+              content: 'Failed to connect to Google services. Please try again.',
+              isUser: false,
+              type: MessageType.llmResponse,
+            ),
+          );
+        });
+      }
+    } else {
+      action();
+    }
+  }
+
   Future<void> _handleFunctionCalls(List<FunctionCall> functionCalls) async {
     for (final call in functionCalls) {
       switch (call.name) {
@@ -988,11 +1041,11 @@ class _ChatScreenState extends State<ChatScreen> {
           }
           break;
         case 'index_emails':
-          _indexEmails();
+          await _executeWithAuth('indexing emails', _indexEmails);
           break;
         case 'index_drive':
           final forceReindex = call.args['force_reindex'] as bool? ?? false;
-          _indexDriveInternal(forceReindex: forceReindex);
+          await _executeWithAuth('indexing Drive files', () => _indexDriveInternal(forceReindex: forceReindex));
           break;
         case 'generate_embeddings':
           _generateMissingEmbeddings();

@@ -18,7 +18,12 @@ class EmailService {
     // Get last sync time
     final prefs = await SharedPreferences.getInstance();
     final lastSyncTime = prefs.getInt('gmail_last_sync_time');
-    final query = lastSyncTime != null ? 'after:${lastSyncTime ~/ 1000}' : null;
+    String? query;
+    if (lastSyncTime != null) {
+      final lastSyncDate = DateTime.fromMillisecondsSinceEpoch(lastSyncTime);
+      final dateStr = '${lastSyncDate.year}/${lastSyncDate.month.toString().padLeft(2, '0')}/${lastSyncDate.day.toString().padLeft(2, '0')}';
+      query = 'after:$dateStr';
+    }
 
     final messages = await gmail.users.messages.list(
       'me',

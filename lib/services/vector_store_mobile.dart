@@ -26,7 +26,19 @@ class ObjectBoxVectorStore extends VectorStore {
   @override
   Future<void> addContents(List<ContentEntity> contents) async {
     await _ensureInitialized();
-    _box.putMany(contents);
+    
+    // Filter out duplicates by checking sourceId
+    final existingSourceIds = <String>{};
+    final allExisting = _box.getAll();
+    for (final existing in allExisting) {
+      existingSourceIds.add(existing.sourceId);
+    }
+    
+    final newContents = contents.where((content) => !existingSourceIds.contains(content.sourceId)).toList();
+    
+    if (newContents.isNotEmpty) {
+      _box.putMany(newContents);
+    }
   }
 
   @override
